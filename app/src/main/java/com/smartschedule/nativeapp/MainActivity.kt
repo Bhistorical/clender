@@ -5,7 +5,9 @@ import android.content.ClipboardManager
 import android.content.Context
 import android.os.Bundle
 import androidx.activity.ComponentActivity
+import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.core.animateDpAsState
 import androidx.compose.foundation.background
@@ -56,11 +58,13 @@ private val TextPrimary = Color(0xFFEDEDED)
 private val TextSecondary = Color(0xFFB4B8C0)
 private val TextMuted = Color(0xFF7E8590)
 private val BrandBlue = Color(0xFF4F9CF9)
+private val SuccessGreen = Color(0xFF22C55E)
 
 class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         val repository = ScheduleRepository(applicationContext)
+        val authHelper = GoogleAuthHelper(applicationContext)
         setContent {
             MaterialTheme(
                 colorScheme = darkColorScheme(
@@ -71,7 +75,7 @@ class MainActivity : ComponentActivity() {
                     onSurface = TextPrimary
                 )
             ) {
-                SmartScheduleApp(repository)
+                SmartScheduleApp(repository = repository, authHelper = authHelper)
             }
         }
     }
@@ -79,7 +83,10 @@ class MainActivity : ComponentActivity() {
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
-fun SmartScheduleApp(repository: ScheduleRepository) {
+fun SmartScheduleApp(
+    repository: ScheduleRepository,
+    authHelper: GoogleAuthHelper
+) {
     val context = LocalContext.current
     val haptic = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
@@ -101,14 +108,94 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
     var skipHolidays by remember { mutableStateOf(true) }
     var showCreateSheet by remember { mutableStateOf(false) }
     var showToolsSheet by remember { mutableStateOf(false) }
+
     var oauthAccessToken by remember { mutableStateOf("") }
-    var syncStatusMsg by remember { mutableStateOf("โหมดในเครื่อง") }
+    var connectedEmail by remember { mutableStateOf(authHelper.savedAccountEmail) }
+    var isSyncing by remember { mutableStateOf(false) }
+    var syncStatusMsg by remember {
+        mutableStateOf(
+            if (authHelper.isGoogleConnectedPref && authHelper.savedAccountEmail.isNotBlank())
+                "เชื่อมต่อ: ${authHelper.savedAccountEmail}"
+            else "โหมดในเครื่อง"
+        )
+    }
+    var authErrorMsg by remember { mutableStateOf("") }
 
     fun persistChanges(newEvents: List<CalendarEvent>, newTasks: List<TaskItem>) {
         val rolled = SmartScheduleEngine.rollOverPastTasks(newTasks)
         events = newEvents
         tasks = rolled
         repository.saveAll(newEvents, rolled)
+    }
+
+    fun executeSyncWithToken(token: String) {
+        oauthAccessToken = token
+        isSyncing = true
+        authErrorMsg = ""
+        syncStatusMsg = "กำลังซิงก์ Google..."
+        scope.launch {
+            val res = repository.syncFromGoogleApis(token)
+            isSyncing = false
+            res.onSuccess { payload ->
+                if (payload.accountEmail.isNotBlank()) {
+                    connectedEmail = payload.accountEmail
+                    authHelper.savedAccountEmail = payload.accountEmail
+                }
+                syncStatusMsg = if (connectedEmail.isNotBlank()) "ซิงก์แล้ว: $connectedEmail" else "ซิงก์ Google API แล้ว"
+                persistChanges(payload.events, payload.tasks)
+            }.onFailure { err ->
+                authErrorMsg = err.localizedMessage ?: "ซิงก์ไม่สำเร็จ"
+                syncStatusMsg = "ซิงก์ไม่สำเร็จ"
+            }
+        }
+    }
+
+    // Launcher รับผลลัพธ์จากหน้าต่างขออนุญาตของ Google (AuthorizationClient)
+    val googleConsentLauncher = rememberLauncherForActivityResult(
+        contract = ActivityResultContracts.StartIntentSenderForResult()
+    ) { activityResult ->
+        authHelper.handleAuthorizationResult(
+            data = activityResult.data,
+            onTokenReady = { token -> executeSyncWithToken(token) },
+            onError = { msg ->
+                isSyncing = false
+                authErrorMsg = msg
+            }
+        )
+    }
+
+    fun startOneTapGoogleSignIn(interactive: Boolean) {
+        authErrorMsg = ""
+        isSyncing = true
+        scope.launch {
+            if (interactive) {
+                context.findActivity()?.let { act ->
+                    authHelper.signInWithCredentialManagerIfConfigured(act)?.let { email ->
+                        connectedEmail = email
+                        authHelper.savedAccountEmail = email
+                    }
+                }
+            }
+            authHelper.authorizeCalendarAndTasks(
+                allowInteractiveResolution = interactive,
+                onTokenReady = { token -> executeSyncWithToken(token) },
+                onNeedConsentScreen = { intentSenderReq ->
+                    isSyncing = false
+                    googleConsentLauncher.launch(intentSenderReq)
+                },
+                onError = { msg ->
+                    isSyncing = false
+                    if (interactive) authErrorMsg = msg
+                }
+            )
+        }
+    }
+
+    // ซิงก์อัตโนมัติเบื้องหลังทันทีเมื่อเปิดแอป หากผู้ใช้เคยล็อกอินไว้แล้ว
+    LaunchedEffect(Unit) {
+        if (authHelper.isGoogleConnectedPref) {
+            startOneTapGoogleSignIn(interactive = false)
+        }
     }
 
     val autoBlocks = remember(events, tasks) {
@@ -152,7 +239,6 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
     Scaffold(
         containerColor = BgDark,
         topBar = {
-            // 1. Passive Top Header: อ่านชื่อเดือนและสถิติอย่างเดียว ไม่ต้องเอื้อมนิ้วกด
             Column(
                 modifier = Modifier
                     .fillMaxWidth()
@@ -170,11 +256,22 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     Box(
                         modifier = Modifier
                             .clip(RoundedCornerShape(50))
-                            .background(Surface1)
-                            .border(1.dp, Surface3, RoundedCornerShape(50))
+                            .background(if (oauthAccessToken.isNotBlank()) SuccessGreen.copy(alpha = 0.14f) else Surface1)
+                            .border(
+                                1.dp,
+                                if (oauthAccessToken.isNotBlank()) SuccessGreen.copy(alpha = 0.4f) else Surface3,
+                                RoundedCornerShape(50)
+                            )
                             .padding(horizontal = 10.dp, vertical = 3.dp)
                     ) {
-                        Text(syncStatusMsg, color = TextSecondary, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
+                        Text(
+                            text = syncStatusMsg,
+                            color = if (oauthAccessToken.isNotBlank()) SuccessGreen else TextSecondary,
+                            fontSize = 11.sp,
+                            fontWeight = FontWeight.SemiBold,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
                     }
                 }
                 Spacer(Modifier.height(4.dp))
@@ -203,7 +300,6 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
             }
         },
         bottomBar = {
-            // 1. Bottom-First & Thumb Zone (โซนนิ้วโป้งด้านล่าง 20% ของหน้าจอ)
             Surface(
                 color = Color(0xF018181B),
                 tonalElevation = 8.dp,
@@ -324,13 +420,24 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     },
                     onExpandNight = { collapseNightHours = false },
                     onUpdateEventTime = { id, newStart, newEnd ->
+                        var targetEv: CalendarEvent? = null
                         val updated = events.map {
-                            if (it.id == id) it.copy(startMin = newStart, endMin = newEnd) else it
+                            if (it.id == id) {
+                                val mod = it.copy(startMin = newStart, endMin = newEnd)
+                                targetEv = mod
+                                mod
+                            } else it
                         }
                         persistChanges(updated, tasks)
+                        if (oauthAccessToken.isNotBlank() && targetEv != null) {
+                            scope.launch { repository.updateEventTimeOnGoogle(oauthAccessToken, targetEv!!) }
+                        }
                     },
                     onDeleteEvent = { id ->
                         persistChanges(events.filterNot { it.id == id }, tasks)
+                        if (oauthAccessToken.isNotBlank()) {
+                            scope.launch { repository.deleteEventFromGoogle(oauthAccessToken, id) }
+                        }
                     }
                 )
 
@@ -346,13 +453,24 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     },
                     onExpandNight = { collapseNightHours = false },
                     onUpdateEventTime = { id, newStart, newEnd ->
+                        var targetEv: CalendarEvent? = null
                         val updated = events.map {
-                            if (it.id == id) it.copy(startMin = newStart, endMin = newEnd) else it
+                            if (it.id == id) {
+                                val mod = it.copy(startMin = newStart, endMin = newEnd)
+                                targetEv = mod
+                                mod
+                            } else it
                         }
                         persistChanges(updated, tasks)
+                        if (oauthAccessToken.isNotBlank() && targetEv != null) {
+                            scope.launch { repository.updateEventTimeOnGoogle(oauthAccessToken, targetEv!!) }
+                        }
                     },
                     onDeleteEvent = { id ->
                         persistChanges(events.filterNot { it.id == id }, tasks)
+                        if (oauthAccessToken.isNotBlank()) {
+                            scope.launch { repository.deleteEventFromGoogle(oauthAccessToken, id) }
+                        }
                     }
                 )
 
@@ -370,7 +488,17 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     autoBlocks = autoBlocks,
                     onToggleDone = { id ->
                         haptic.performHapticFeedback(HapticFeedbackType.LongPress)
-                        persistChanges(events, tasks.map { if (it.id == id) it.copy(completed = !it.completed) else it })
+                        var newDone = false
+                        val updated = tasks.map {
+                            if (it.id == id) {
+                                newDone = !it.completed
+                                it.copy(completed = newDone)
+                            } else it
+                        }
+                        persistChanges(events, updated)
+                        if (oauthAccessToken.isNotBlank()) {
+                            scope.launch { repository.updateTaskStatusOnGoogle(oauthAccessToken, id, newDone) }
+                        }
                     },
                     onSwipeTomorrow = { id ->
                         haptic.performHapticFeedback(HapticFeedbackType.TextHandleMove)
@@ -387,30 +515,45 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     },
                     onDeleteTask = { id ->
                         persistChanges(events, tasks.filterNot { it.id == id })
+                        if (oauthAccessToken.isNotBlank()) {
+                            scope.launch { repository.deleteTaskFromGoogle(oauthAccessToken, id) }
+                        }
                     }
                 )
             }
         }
     }
 
-    // Bottom Sheet 1: เพิ่มนัดหมาย (พิมพ์ภาษาคน NLP + กรอกละเอียด) & เพิ่มงาน Auto Time-block
     if (showCreateSheet) {
         CreateItemBottomSheet(
             initialDate = selectedDate,
             onDismiss = { showCreateSheet = false },
             onAddEvent = { newEv ->
                 selectedDate = newEv.date
-                persistChanges(events + newEv, tasks)
                 showCreateSheet = false
+                if (oauthAccessToken.isNotBlank()) {
+                    scope.launch {
+                        val syncedEv = repository.pushEventToGoogle(oauthAccessToken, newEv)
+                        persistChanges(events + syncedEv, tasks)
+                    }
+                } else {
+                    persistChanges(events + newEv, tasks)
+                }
             },
             onAddTask = { newTk ->
-                persistChanges(events, listOf(newTk) + tasks)
                 showCreateSheet = false
+                if (oauthAccessToken.isNotBlank()) {
+                    scope.launch {
+                        val syncedTk = repository.pushTaskToGoogle(oauthAccessToken, newTk)
+                        persistChanges(events, listOf(syncedTk) + tasks)
+                    }
+                } else {
+                    persistChanges(events, listOf(newTk) + tasks)
+                }
             }
         )
     }
 
-    // Bottom Sheet 2: ลิงก์นัดเวลาว่างในตัว + เงื่อนไขแจ้งเตือน + Google Calendar/Tasks Sync
     if (showToolsSheet) {
         ToolsAndSyncBottomSheet(
             events = events,
@@ -418,7 +561,10 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
             activeReminderCtx = activeReminderCtx,
             skipHolidays = skipHolidays,
             collapseNightHours = collapseNightHours,
-            oauthToken = oauthAccessToken,
+            isConnected = oauthAccessToken.isNotBlank(),
+            connectedEmail = connectedEmail,
+            isSyncing = isSyncing,
+            authErrorMsg = authErrorMsg,
             onChangeContext = { activeReminderCtx = it },
             onToggleHolidays = { skipHolidays = it },
             onToggleNight = { collapseNightHours = it },
@@ -432,19 +578,24 @@ fun SmartScheduleApp(repository: ScheduleRepository) {
                     location = "ลิงก์นัดเวลา",
                     category = CategoryType.MEETING
                 )
-                persistChanges(events + booked, tasks)
                 showToolsSheet = false
-            },
-            onSyncGoogle = { token ->
-                oauthAccessToken = token
-                scope.launch {
-                    val res = repository.syncFromGoogleApis(token)
-                    res.onSuccess { (gEvents, gTasks) ->
-                        syncStatusMsg = "ซิงก์ Google API แล้ว"
-                        persistChanges(gEvents, gTasks)
-                    }.onFailure { err ->
-                        syncStatusMsg = "ซิงก์ไม่สำเร็จ: ${err.message?.take(28)}"
+                if (oauthAccessToken.isNotBlank()) {
+                    scope.launch {
+                        val remote = repository.pushEventToGoogle(oauthAccessToken, booked)
+                        persistChanges(events + remote, tasks)
                     }
+                } else {
+                    persistChanges(events + booked, tasks)
+                }
+            },
+            onOneTapGoogleSignIn = { startOneTapGoogleSignIn(interactive = true) },
+            onSignOutGoogle = {
+                scope.launch {
+                    authHelper.signOut()
+                    oauthAccessToken = ""
+                    connectedEmail = ""
+                    syncStatusMsg = "โหมดในเครื่อง"
+                    authErrorMsg = ""
                 }
             },
             onCopyLink = { url ->
@@ -470,7 +621,6 @@ private fun ThumbChip(label: String, onClick: () -> Unit) {
     }
 }
 
-// 2. Collapsible Month + Agenda View (ปัดขึ้นเพื่อหดปฏิทินเดือนเหลือแถบ 1 สัปดาห์)
 @Composable
 private fun CollapsibleMonthAgendaPane(
     selectedDate: LocalDate,
@@ -587,7 +737,6 @@ private fun CollapsibleMonthAgendaPane(
     }
 }
 
-// 3. 3-Day Weekly View (วันนี้ + พรุ่งนี้ + มะรืน ปัดซ้าย-ขวาเลื่อนวัน)
 @Composable
 private fun ThreeDaySwipePane(
     anchorDate: LocalDate,
@@ -649,7 +798,6 @@ private fun ThreeDaySwipePane(
     }
 }
 
-// 4 & 5. ไทม์ไลน์โหมดมืด #121212 ย่อช่วง 01:00–06:00 + แตะค้างลากย้ายและดึงขอบล่างยืดเวลาพร้อม Haptic
 @Composable
 private fun ScannableHourlyTimeline(
     dates: List<LocalDate>,
@@ -666,7 +814,6 @@ private fun ScannableHourlyTimeline(
     val hourDp = 56.dp
     val collapsedNightDp = 28.dp
     val hourPx = with(density) { hourDp.toPx() }
-    val nightPx = with(density) { collapsedNightDp.toPx() }
 
     val hasNightItems = events.any { it.date in dates && !it.allDay && it.startMin < 360 && it.endMin > 60 }
     val nightCollapsed = collapseNightHours && !hasNightItems
@@ -799,7 +946,6 @@ private fun ScannableHourlyTimeline(
                             }
                         }
 
-                        // ขอบล่างสำหรับดึงยืด-หดเวลา (Snap-to-grid Resize Handle)
                         if (!blk.isAutoBlock) {
                             Box(
                                 modifier = Modifier
@@ -839,7 +985,6 @@ private fun ScannableHourlyTimeline(
     }
 }
 
-// 5. Continuous Scroll เลื่อนดูข้ามเดือนไร้รอยต่อ
 @Composable
 private fun ContinuousStreamPane(
     events: List<CalendarEvent>,
@@ -896,7 +1041,6 @@ private fun ContinuousStreamPane(
     }
 }
 
-// 4. Swipeable Tasks + กล่องพักงาน (Unscheduled Inbox)
 @Composable
 private fun SwipeTasksAndInboxPane(
     tasks: List<TaskItem>,
@@ -1115,16 +1259,19 @@ private fun ToolsAndSyncBottomSheet(
     activeReminderCtx: ReminderContext,
     skipHolidays: Boolean,
     collapseNightHours: Boolean,
-    oauthToken: String,
+    isConnected: Boolean,
+    connectedEmail: String,
+    isSyncing: Boolean,
+    authErrorMsg: String,
     onChangeContext: (ReminderContext) -> Unit,
     onToggleHolidays: (Boolean) -> Unit,
     onToggleNight: (Boolean) -> Unit,
     onBookFreeSlot: (LocalDate, IntRange, String, String) -> Unit,
-    onSyncGoogle: (String) -> Unit,
+    onOneTapGoogleSignIn: () -> Unit,
+    onSignOutGoogle: () -> Unit,
     onCopyLink: (String) -> Unit,
     onDismiss: () -> Unit
 ) {
-    var tokenText by remember { mutableStateOf(oauthToken) }
     val freeSlots = remember(events, autoBlocks) { SmartScheduleEngine.findMutualFreeSlots(events, autoBlocks, 60) }
 
     ModalBottomSheet(onDismissRequest = onDismiss, containerColor = Surface1) {
@@ -1134,6 +1281,57 @@ private fun ToolsAndSyncBottomSheet(
                 .verticalScroll(rememberScrollState()),
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
+            // ส่วนที่ 1: ปุ่ม Sign in with Google กดครั้งเดียวซิงก์ทันที
+            Text("บัญชี Google Calendar & Google Tasks", color = TextPrimary, fontWeight = FontWeight.Bold)
+            if (isConnected) {
+                Text(
+                    text = if (connectedEmail.isNotBlank()) "เชื่อมต่อกับ $connectedEmail แล้ว" else "เชื่อมต่อบัญชี Google เรียบร้อยแล้ว",
+                    color = SuccessGreen,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                    Button(
+                        onClick = onOneTapGoogleSignIn,
+                        enabled = !isSyncing,
+                        modifier = Modifier.weight(1f),
+                        colors = ButtonDefaults.buttonColors(containerColor = Color(0xFF2563EB))
+                    ) {
+                        Text(if (isSyncing) "กำลังซิงก์..." else "ซิงก์ข้อมูลล่าสุดทันที")
+                    }
+                    OutlinedButton(onClick = onSignOutGoogle, enabled = !isSyncing) {
+                        Text("ออกจากระบบ", color = TextSecondary)
+                    }
+                }
+            } else {
+                Text(
+                    text = "กดปุ่มด้านล่างเพื่อเลือกบัญชี Google และอนุญาตสิทธิ์ซิงก์ตารางนัดหมายกับรายการงาน 2 ทางอัตโนมัติ",
+                    color = TextSecondary,
+                    fontSize = 12.sp
+                )
+                Button(
+                    onClick = onOneTapGoogleSignIn,
+                    enabled = !isSyncing,
+                    modifier = Modifier.fillMaxWidth(),
+                    shape = RoundedCornerShape(12.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = Color.White, contentColor = Color(0xFF1F1F1F)),
+                    contentPadding = PaddingValues(vertical = 12.dp)
+                ) {
+                    Icon(Icons.Default.AccountCircle, contentDescription = null, tint = Color(0xFF1A73E8))
+                    Spacer(Modifier.width(8.dp))
+                    Text(
+                        text = if (isSyncing) "กำลังเชื่อมต่อ Google..." else "Sign in with Google & ซิงก์ทันที",
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 14.sp
+                    )
+                }
+            }
+
+            if (authErrorMsg.isNotBlank()) {
+                Text(authErrorMsg, color = Color(0xFFFCA5A5), fontSize = 12.sp)
+            }
+
+            HorizontalDivider(color = Surface3)
             Text("แจ้งเตือนแบบมีเงื่อนไข & ไทม์ไลน์", color = TextPrimary, fontWeight = FontWeight.Bold)
             Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
                 ReminderContext.entries.forEach { ctx ->
@@ -1160,22 +1358,6 @@ private fun ToolsAndSyncBottomSheet(
                         onBookFreeSlot(date, rng, "ผู้ร่วมงาน", "ประชุมนัดหมาย")
                     }
                 }
-            }
-
-            HorizontalDivider(color = Surface3)
-            Text("ซิงก์ Google Calendar & Google Tasks API (OAuth 2.0)", color = TextPrimary, fontWeight = FontWeight.Bold)
-            OutlinedTextField(
-                value = tokenText,
-                onValueChange = { tokenText = it },
-                placeholder = { Text("วาง OAuth 2.0 Access Token เพื่อดึงข้อมูลจริง") },
-                singleLine = true,
-                modifier = Modifier.fillMaxWidth()
-            )
-            Button(
-                onClick = { if (tokenText.isNotBlank()) onSyncGoogle(tokenText.trim()) },
-                modifier = Modifier.fillMaxWidth()
-            ) {
-                Text("ซิงก์ข้อมูล 2 ทางกับ Google ทันที")
             }
             Spacer(Modifier.height(20.dp))
         }

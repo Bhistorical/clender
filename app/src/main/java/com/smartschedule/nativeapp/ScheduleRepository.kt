@@ -10,10 +10,19 @@ import org.json.JSONArray
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
+import java.net.URLEncoder
 import java.time.Instant
 import java.time.LocalDate
+import java.time.LocalTime
 import java.time.ZoneId
 import java.time.ZonedDateTime
+import java.time.format.DateTimeFormatter
+
+data class GoogleSyncPayload(
+    val accountEmail: String,
+    val events: List<CalendarEvent>,
+    val tasks: List<TaskItem>
+)
 
 class ScheduleRepository(private val context: Context) {
 
@@ -132,18 +141,26 @@ class ScheduleRepository(private val context: Context) {
         }
     }
 
-    // ซิงก์ 2 ทางกับ Google Calendar API v3 & Google Tasks API v1 ด้วย OAuth 2.0 Access Token
-    suspend fun syncFromGoogleApis(accessToken: String): Result<Pair<List<CalendarEvent>, List<TaskItem>>> =
+    // ดึงข้อมูลจาก Google Calendar API v3 & Google Tasks API v1 ทันทีที่ได้ accessToken
+    suspend fun syncFromGoogleApis(accessToken: String): Result<GoogleSyncPayload> =
         withContext(Dispatchers.IO) {
             runCatching {
                 val zone = ZoneId.systemDefault()
-                val timeMin = ZonedDateTime.now(zone).minusDays(14).toInstant().toString()
-                val calJson = httpGet(
+                val timeMin = URLEncoder.encode(ZonedDateTime.now(zone).minusDays(14).toInstant().toString(), "UTF-8")
+
+                val calMetaJson = runCatching {
+                    httpRequest("GET", "https://www.googleapis.com/calendar/v3/calendars/primary", accessToken)
+                }.getOrDefault("{}")
+                val accountEmail = JSONObject(calMetaJson).optString("id", "")
+
+                val calJson = httpRequest(
+                    "GET",
                     "https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=$timeMin&maxResults=100",
                     accessToken
                 )
-                val tasksJson = httpGet(
-                    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?showCompleted=true&maxResults=100",
+                val tasksJson = httpRequest(
+                    "GET",
+                    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks?showCompleted=true&showHidden=true&maxResults=100",
                     accessToken
                 )
 
@@ -168,9 +185,9 @@ class ScheduleRepository(private val context: Context) {
                     } else {
                         val sIso = startObj.optString("dateTime", "")
                         if (sIso.isNotEmpty()) {
-                            val sZdt = Instant.parse(sIso).atZone(zone)
+                            val sZdt = ZonedDateTime.parse(sIso).withZoneSameInstant(zone)
                             val eZdt = endObj?.optString("dateTime", "")?.takeIf { it.isNotEmpty() }
-                                ?.let { Instant.parse(it).atZone(zone) } ?: sZdt.plusHours(1)
+                                ?.let { ZonedDateTime.parse(it).withZoneSameInstant(zone) } ?: sZdt.plusHours(1)
                             syncedEvents.add(
                                 CalendarEvent(
                                     id = item.optString("id"),
@@ -204,20 +221,134 @@ class ScheduleRepository(private val context: Context) {
                     )
                 }
 
-                syncedEvents to syncedTasks
+                GoogleSyncPayload(accountEmail, syncedEvents, syncedTasks)
             }
         }
 
-    private fun httpGet(urlStr: String, bearerToken: String): String {
+    // ซิงก์ขาเขียนกลับไปยัง Google Calendar API & Google Tasks API (Two-Way Write-Back)
+    suspend fun pushEventToGoogle(accessToken: String, event: CalendarEvent): CalendarEvent =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val zone = ZoneId.systemDefault()
+                val body = JSONObject().apply {
+                    put("summary", event.title)
+                    if (event.location.isNotBlank()) put("location", event.location)
+                    if (event.allDay) {
+                        put("start", JSONObject().put("date", event.date.toString()))
+                        put("end", JSONObject().put("date", event.date.plusDays(1).toString()))
+                    } else {
+                        val sZdt = ZonedDateTime.of(event.date, LocalTime.of(event.startMin / 60, event.startMin % 60), zone)
+                        val safeEnd = event.endMin.coerceIn(event.startMin + 15, 1439)
+                        val eZdt = ZonedDateTime.of(event.date, LocalTime.of(safeEnd / 60, safeEnd % 60), zone)
+                        put("start", JSONObject().put("dateTime", sZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)))
+                        put("end", JSONObject().put("dateTime", eZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)))
+                    }
+                }
+                val resp = httpRequest(
+                    "POST",
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events",
+                    accessToken,
+                    body.toString()
+                )
+                val remoteId = JSONObject(resp).optString("id", event.id)
+                event.copy(id = remoteId)
+            }.getOrDefault(event)
+        }
+
+    suspend fun updateEventTimeOnGoogle(accessToken: String, event: CalendarEvent) =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val zone = ZoneId.systemDefault()
+                val sZdt = ZonedDateTime.of(event.date, LocalTime.of(event.startMin / 60, event.startMin % 60), zone)
+                val safeEnd = event.endMin.coerceIn(event.startMin + 15, 1439)
+                val eZdt = ZonedDateTime.of(event.date, LocalTime.of(safeEnd / 60, safeEnd % 60), zone)
+                val patchBody = JSONObject().apply {
+                    put("start", JSONObject().put("dateTime", sZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)))
+                    put("end", JSONObject().put("dateTime", eZdt.format(DateTimeFormatter.ISO_OFFSET_DATE_TIME)))
+                }
+                val encodedId = URLEncoder.encode(event.id, "UTF-8")
+                httpRequest(
+                    "PATCH",
+                    "https://www.googleapis.com/calendar/v3/calendars/primary/events/$encodedId",
+                    accessToken,
+                    patchBody.toString()
+                )
+            }
+        }
+
+    suspend fun deleteEventFromGoogle(accessToken: String, eventId: String) =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val encodedId = URLEncoder.encode(eventId, "UTF-8")
+                httpRequest("DELETE", "https://www.googleapis.com/calendar/v3/calendars/primary/events/$encodedId", accessToken)
+            }
+        }
+
+    suspend fun pushTaskToGoogle(accessToken: String, task: TaskItem): TaskItem =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val body = JSONObject().apply {
+                    put("title", task.title)
+                    task.dueDate?.let { put("due", "${it}T00:00:00.000Z") }
+                }
+                val resp = httpRequest(
+                    "POST",
+                    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks",
+                    accessToken,
+                    body.toString()
+                )
+                val remoteId = JSONObject(resp).optString("id", task.id)
+                task.copy(id = remoteId)
+            }.getOrDefault(task)
+        }
+
+    suspend fun updateTaskStatusOnGoogle(accessToken: String, taskId: String, completed: Boolean) =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val body = JSONObject().apply {
+                    put("status", if (completed) "completed" else "needsAction")
+                    if (completed) put("completed", Instant.now().toString()) else put("completed", JSONObject.NULL)
+                }
+                val encodedId = URLEncoder.encode(taskId, "UTF-8")
+                httpRequest(
+                    "PATCH",
+                    "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks/$encodedId",
+                    accessToken,
+                    body.toString()
+                )
+            }
+        }
+
+    suspend fun deleteTaskFromGoogle(accessToken: String, taskId: String) =
+        withContext(Dispatchers.IO) {
+            runCatching {
+                val encodedId = URLEncoder.encode(taskId, "UTF-8")
+                httpRequest("DELETE", "https://tasks.googleapis.com/tasks/v1/lists/@default/tasks/$encodedId", accessToken)
+            }
+        }
+
+    private fun httpRequest(method: String, urlStr: String, bearerToken: String, jsonBody: String? = null): String {
         val conn = (URL(urlStr).openConnection() as HttpURLConnection).apply {
-            requestMethod = "GET"
+            // รองรับ PATCH บน Android HttpURLConnection ผ่าน X-HTTP-Method-Override ของ Google REST API
+            if (method == "PATCH") {
+                requestMethod = "POST"
+                setRequestProperty("X-HTTP-Method-Override", "PATCH")
+            } else {
+                requestMethod = method
+            }
             setRequestProperty("Authorization", "Bearer $bearerToken")
-            connectTimeout = 10000
-            readTimeout = 10000
+            connectTimeout = 12000
+            readTimeout = 12000
+            if (jsonBody != null) {
+                doOutput = true
+                setRequestProperty("Content-Type", "application/json; charset=UTF-8")
+                outputStream.use { it.write(jsonBody.toByteArray(Charsets.UTF_8)) }
+            }
         }
         val code = conn.responseCode
+        if (code == 204) return ""
         val stream = if (code in 200..299) conn.inputStream else conn.errorStream
-        val body = stream.bufferedReader().use { it.readText() }
+        val body = stream?.bufferedReader()?.use { it.readText() } ?: ""
         if (code !in 200..299) error("Google API HTTP $code: $body")
         return body
     }
